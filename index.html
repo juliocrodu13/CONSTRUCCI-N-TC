@@ -314,6 +314,7 @@ thead th:last-child{position:sticky;right:0;z-index:4;background:var(--panel-2);
     <select class="select-filter" id="procesoFilter"><option value="">Todas las áreas</option></select>
     <button class="btn btn-ghost" id="clearFiltersBtn">Limpiar filtros</button>
     <button class="btn btn-ghost" id="toggleExpandBtn">⛶ Expandir tabla</button>
+    <button class="btn btn-ghost" id="exportExcelBtn">⬇ Descargar Excel</button>
     <button class="btn btn-primary" id="addBtn">+ Nuevo requisito</button>
   </div>
   <div class="toolbar" style="margin-top:-8px;">
@@ -1410,9 +1411,46 @@ thead th:last-child{position:sticky;right:0;z-index:4;background:var(--panel-2);
   function extraerCantidad(textoCercano){
     const m = textoCercano.match(/\((\d+)\)/);
     if(m) return parseInt(m[1],10);
-    const claves = Object.keys(NUM_ES).sort((a,b)=>b.length-a.length);
     const t = textoCercano.toLowerCase();
+    // Preferimos un número en dígitos reales sobre una palabra numérica,
+    // porque palabras como "un"/"una" son también artículos comunes ("una vez", "un mes")
+    // y causarían falsos positivos si se buscaran primero.
+    const suelto = t.match(/\b(\d{1,3})\b/);
+    if(suelto) return parseInt(suelto[1],10);
+    const claves = Object.keys(NUM_ES).sort((a,b)=>b.length-a.length);
     for(const palabra of claves){ if(t.includes(palabra)) return NUM_ES[palabra]; }
+    return null;
+  }
+
+  // Frases que equivalen a "Inicio de Operación" (21-jul-2026) — incluye el hecho de que
+  // el FIN de la Etapa Preoperativa es, matemáticamente, el mismo día que el INICIO de Operación.
+  const FRASES_INICIO_OPERACION = [
+    "inicio de la etapa de operación","inicio de operación","inicio de dicha etapa",
+    "iniciada la etapa de operación","iniciada la operación","inicio de la operación",
+    "iniciado la etapa de operación","inicio de la operación comercial",
+    "finalizada la etapa preoperativa","finalizada la etapa de preoperativa",
+    "finalice la etapa preoperativa","finalice la etapa de preoperativa",
+    "termine la etapa preoperativa","último día de la etapa preoperativa",
+    "última día de la etapa de preoperativa"
+  ];
+  // Frases que equivalen al "Acta de Inicio" del Contrato (20-mar-2026) / inicio de la Etapa Preoperativa
+  const FRASES_ACTA_INICIO = [
+    "acta de inicio","inicio de la etapa preoperativa","inicio de la etapa de preoperativa",
+    "se inicie la etapa preoperativa","se inicie la etapa de preoperativa",
+    "previo al inicio de actividades del contrato","inicio de actividades del contrato"
+  ];
+
+  // Detecta patrones como "primeros/primer... de la Etapa de Operación/Preoperativa" sin decir
+  // literalmente "inicio". Trae su propia salvaguarda: si el texto menciona AMBAS etapas a la vez,
+  // es una frase compuesta con dos plazos distintos mezclados — no se adivina, se deja pendiente.
+  function detectarHitoCompuesto(t){
+    const mencionaPreoperativa = t.includes("etapa preoperativa") || t.includes("etapa de preoperativa");
+    const mencionaOperacion = t.includes("etapa de operación");
+    if(mencionaPreoperativa && mencionaOperacion) return null;
+    if(/primer[oa]?s?\b/.test(t)){
+      if(mencionaOperacion) return "inicioOperacion";
+      if(mencionaPreoperativa) return "actaInicio";
+    }
     return null;
   }
 
@@ -1421,11 +1459,18 @@ thead th:last-child{position:sticky;right:0;z-index:4;background:var(--panel-2);
   function resolverReglaDesdeTexto(texto){
     if(!texto) return null;
     const t = texto.toLowerCase();
+
+    // Salvaguarda: "con revisión" / "y revisión" casi siempre indica dos plazos combinados
+    // en la misma frase (entrega inicial + revisión posterior) — no se deben mezclar.
+    if(/con revisi[oó]n|y revisi[oó]n/.test(t)) return null;
+
     let hito = null;
-    if(t.includes("inicio de la etapa de operación") || t.includes("inicio de operación") || t.includes("inicio de dicha etapa")){
+    if(FRASES_INICIO_OPERACION.some(f=>t.includes(f))){
       hito = "inicioOperacion";
-    } else if(t.includes("acta de inicio")){
+    } else if(FRASES_ACTA_INICIO.some(f=>t.includes(f))){
       hito = "actaInicio";
+    } else {
+      hito = detectarHitoCompuesto(t);
     }
     if(!hito) return null;
     const direccion = /\bantes\b|antelaci[oó]n|previo/.test(t) ? "antes" : "despues";
@@ -1434,9 +1479,9 @@ thead th:last-child{position:sticky;right:0;z-index:4;background:var(--panel-2);
     else if(/\bmes(es)?\b/.test(t)) unidad = "meses";
     else if(/\bd[ií]a/.test(t)) unidad = "dias";
     if(!unidad) return null;
-    const keywords = ["acta de inicio","inicio de la etapa de operación","inicio de operación","inicio de dicha etapa"];
+    const keywords = [...FRASES_INICIO_OPERACION, ...FRASES_ACTA_INICIO, "etapa de operación","etapa preoperativa","etapa de preoperativa"];
     let idxKw = -1;
-    for(const kw of keywords){ const p = t.indexOf(kw); if(p>=0){ idxKw=p; break; } }
+    for(const kw of keywords){ const p = t.indexOf(kw); if(p>=0 && (idxKw===-1 || p<idxKw)){ idxKw=p; } }
     const ventana = idxKw>=0 ? t.slice(Math.max(0,idxKw-60), idxKw) : t.slice(0,80);
     const cantidad = extraerCantidad(ventana) || extraerCantidad(t.slice(0,120));
     if(!cantidad) return null;
@@ -1737,6 +1782,49 @@ thead th:last-child{position:sticky;right:0;z-index:4;background:var(--panel-2);
       tabla.style.maxHeight = "calc(100vh - 130px)";
       btn.textContent = "← Volver";
     }
+  });
+
+  document.getElementById("exportExcelBtn").addEventListener("click", ()=>{
+    // Respeta el mismo alcance que ya ve cada rol en pantalla: un área solo exporta lo suyo;
+    // Calidad y Directores exportan todo (igual que ya ven en la tabla).
+    const alcance = (role && role.type==="area") ? data.filter(r=>r.proceso===role.area) : data;
+    if(alcance.length===0){ showToast("No hay requisitos para exportar en tu alcance actual.", true); return; }
+
+    const filas = alcance.map(r=>{
+      const fase = calcFase(r);
+      const dias = calcDias(r);
+      const alerta = calcAlerta(r);
+      return {
+        "Proceso": r.proceso || "",
+        "Documento de Referencia": r.documento || "",
+        "Capitulo/Seccion": r.capituloSeccion || "",
+        "Clausula/Numeral": r.clausulaNumeral || "",
+        "Pagina": r.pagina || "",
+        "Descripcion de la Obligacion": r.desc || "",
+        "Tipo de Obligacion": r.tipoObligacion || "Puntual",
+        "Frecuencia": r.frecuencia || "",
+        "Regla de Vencimiento (texto original)": r.reglaVencimiento || "",
+        "Fase": fase || "",
+        "Fecha Limite / Proxima Verificacion": fmtDate(r),
+        "Dias Restantes": dias===null ? "" : dias,
+        "Alerta": alerta.label || "",
+        "Estado": r.estado || "",
+        "Numero de Radicado": r.radicado || "Sin radicar",
+        "Medios de Verificacion": r.medio || "",
+        "Observaciones": r.obs || ""
+      };
+    });
+
+    const ws = XLSX.utils.json_to_sheet(filas);
+    ws["!cols"] = [
+      {wch:16},{wch:26},{wch:18},{wch:16},{wch:8},{wch:42},{wch:12},{wch:12},
+      {wch:36},{wch:16},{wch:18},{wch:10},{wch:16},{wch:12},{wch:20},{wch:26},{wch:30}
+    ];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Plan de Calidad");
+    const hoy = new Date().toISOString().slice(0,10);
+    XLSX.writeFile(wb, `Plan_de_Calidad_TransMiCable_${hoy}.xlsx`);
+    showToast(`Excel descargado: ${filas.length} requisito(s).`);
   });
 
   function actualizarBannerConexion(){
